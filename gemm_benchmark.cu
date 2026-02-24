@@ -16,13 +16,13 @@
  *   - Memory bandwidth reporting
  *
  * Compile:
- *   nvcc gemm_benchmark_complete.cu -O3 --gpu-architecture=sm_80 -o gemm_benchmark
+ *   nvcc gemm_benchmark.cu -O3 --gpu-architecture=sm_89 -o gemm_benchmark
  *   (Adjust sm_80 to match your GPU architecture: sm_70 for V100, sm_80 for A100, sm_89 for H100)
  *
  * Run:
  *   ./gemm_benchmark
  *
- * Author: Claude Code
+ * Author: Claude Code, liy
  * Date: 2026
  ***************************************************************************************************/
 
@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <numeric>
 #include <chrono>
+#include <map>
 
 using namespace nvcuda;
 
@@ -369,6 +370,9 @@ int main() {
     CUDA_CHECK(cudaGetDevice(&device));
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+	int memoryClockRate = 0, memoryBusWidth = 1;
+	CUDA_CHECK(cudaDeviceGetAttribute(&memoryClockRate, cudaDevAttrClockRate, device));
+	CUDA_CHECK(cudaDeviceGetAttribute(&memoryBusWidth, cudaDevAttrGlobalMemoryBusWidth, device));
 
     std::cout << "========================================" << std::endl;
     std::cout << "      GEMM Performance Benchmark" << std::endl;
@@ -376,7 +380,7 @@ int main() {
     std::cout << "Device: " << prop.name << std::endl;
     std::cout << "Compute Capability: " << prop.major << "." << prop.minor << std::endl;
     std::cout << "Peak Memory Bandwidth: "
-              << (2.0 * prop.memoryClockRate * (prop.memoryBusWidth / 8) / 1.0e6)
+              << (2.0 * memoryClockRate * (memoryBusWidth / 8) / 1.0e6)
               << " GB/s" << std::endl;
     std::cout << "Total Global Memory: " << (prop.totalGlobalMem / 1024.0 / 1024.0 / 1024.0)
               << " GB" << std::endl;
