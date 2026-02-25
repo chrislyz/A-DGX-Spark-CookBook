@@ -16,8 +16,8 @@
  *   - Memory bandwidth reporting
  *
  * Compile:
- *   nvcc gemm_benchmark.cu -O3 --gpu-architecture=sm_89 -o gemm_benchmark
- *   (Adjust sm_80 to match your GPU architecture: sm_70 for V100, sm_80 for A100, sm_89 for H100)
+ *   nvcc gemm_benchmark_complete.cu -O3 --gpu-architecture=sm_89 -o gemm_benchmark
+ *   (Adjust sm_89 to match your GPU architecture: sm_70 for V100, sm_80 for A100, sm_89 for H100)
  *
  * Run:
  *   ./gemm_benchmark
@@ -30,6 +30,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <mma.h>
+#include <cublas_v2.h>
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -64,6 +65,15 @@ using namespace nvcuda;
     } \
 } while(0)
 
+#define CUBLAS_CHECK(call) do { \
+    cublasStatus_t status = call; \
+    if (status != CUBLAS_STATUS_SUCCESS) { \
+        std::cerr << "cuBLAS Error at " << __FILE__ << ":" << __LINE__ << " - " \
+                  << status << std::endl; \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+
 // ================================================================================================
 // Kernel 1: FP32 Shared Memory GEMM (CUDA Cores)
 // ================================================================================================
@@ -81,6 +91,7 @@ __global__ void gemm_fp32_kernel(const float *A, const float *B, float *C,
     // Loop over tiles
     for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; t++) {
         // Load tiles into shared memory
+        // Known issue: Bank conflicts can occur here, but we keep the benchmark simple
         if (row < M && (t * TILE_SIZE + threadIdx.x) < K)
             Asub[threadIdx.y][threadIdx.x] = A[row * K + t * TILE_SIZE + threadIdx.x];
         else
@@ -112,8 +123,15 @@ __global__ void gemm_fp32_kernel(const float *A, const float *B, float *C,
 
 __global__ void gemm_fp16_tensorcore_kernel(const half *A, const half *B, float *C,
                                             int M, int N, int K) {
-    int warpM = blockIdx.y * blockDim.y + threadIdx.y;
-    int warpN = blockIdx.x * blockDim.x + threadIdx.x;
+    // Calculate warp ID within the grid
+    // Each block contains blockDim.x * blockDim.y / 32 warps
+    // Each warp (32 threads) computes one 16x16 output tile
+    int warpId = (threadIdx.y * blockDim.x + threadIdx.x) / 32;
+    int warpsPerBlock = (blockDim.x * blockDim.y) / 32;
+
+    // Calculate which 16x16 tile this warp is responsible for
+    int warpM = blockIdx.y * (blockDim.y / 32) + (warpId / (blockDim.x / 32));
+    int warpN = blockIdx.x * (blockDim.x / 32) + (warpId % (blockDim.x / 32));
 
     if (warpM * WMMA_M >= M || warpN * WMMA_N >= N)
         return;
@@ -147,8 +165,12 @@ __global__ void gemm_fp16_tensorcore_kernel(const half *A, const half *B, float 
 __global__ void gemm_bf16_tensorcore_kernel(const __nv_bfloat16 *A, const __nv_bfloat16 *B,
                                             float *C, int M, int N, int K) {
 #if __CUDA_ARCH__ >= 800
-    int warpM = blockIdx.y * blockDim.y + threadIdx.y;
-    int warpN = blockIdx.x * blockDim.x + threadIdx.x;
+    // Calculate warp ID within the grid (same pattern as FP16 kernel)
+    int warpId = (threadIdx.y * blockDim.x + threadIdx.x) / 32;
+    int warpsPerBlock = (blockDim.x * blockDim.y) / 32;
+
+    int warpM = blockIdx.y * (blockDim.y / 32) + (warpId / (blockDim.x / 32));
+    int warpN = blockIdx.x * (blockDim.x / 32) + (warpId % (blockDim.x / 32));
 
     if (warpM * WMMA_M >= M || warpN * WMMA_N >= N)
         return;
@@ -171,6 +193,66 @@ __global__ void gemm_bf16_tensorcore_kernel(const __nv_bfloat16 *A, const __nv_b
     float *tileC = C + (warpM * WMMA_M) * N + (warpN * WMMA_N);
     wmma::store_matrix_sync(tileC, c_frag, N, wmma::mem_row_major);
 #endif
+}
+
+// ================================================================================================
+// cuBLAS GEMM Wrappers
+// ================================================================================================
+
+// cuBLAS FP32 GEMM: C = A × B
+void cublas_gemm_fp32(cublasHandle_t handle, const float *A, const float *B, float *C,
+                      int M, int N, int K) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    // cuBLAS uses column-major, so we compute: C = B^T × A^T to get row-major result
+    // C (M×N) = A (M×K) × B (K×N)
+    // In column-major: C^T (N×M) = B^T (N×K) × A^T (K×M)
+    CUBLAS_CHECK(cublasSgemm(handle,
+                            CUBLAS_OP_N, CUBLAS_OP_N,
+                            N, M, K,
+                            &alpha,
+                            B, N,
+                            A, K,
+                            &beta,
+                            C, N));
+}
+
+// cuBLAS FP16 GEMM with FP32 accumulation: C = A × B
+void cublas_gemm_fp16(cublasHandle_t handle, const half *A, const half *B, float *C,
+                      int M, int N, int K) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    // Use cublasGemmEx for mixed precision
+    CUBLAS_CHECK(cublasGemmEx(handle,
+                             CUBLAS_OP_N, CUBLAS_OP_N,
+                             N, M, K,
+                             &alpha,
+                             B, CUDA_R_16F, N,
+                             A, CUDA_R_16F, K,
+                             &beta,
+                             C, CUDA_R_32F, N,
+                             CUBLAS_COMPUTE_32F,
+                             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+// cuBLAS BF16 GEMM with FP32 accumulation: C = A × B
+void cublas_gemm_bf16(cublasHandle_t handle, const __nv_bfloat16 *A, const __nv_bfloat16 *B,
+                      float *C, int M, int N, int K) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    CUBLAS_CHECK(cublasGemmEx(handle,
+                             CUBLAS_OP_N, CUBLAS_OP_N,
+                             N, M, K,
+                             &alpha,
+                             B, CUDA_R_16BF, N,
+                             A, CUDA_R_16BF, K,
+                             &beta,
+                             C, CUDA_R_32F, N,
+                             CUBLAS_COMPUTE_32F,
+                             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
 // ================================================================================================
@@ -360,6 +442,115 @@ void run_benchmark(const std::string &name,
     results.push_back(result);
 }
 
+// cuBLAS benchmark runner (separate because it doesn't use kernel launch parameters)
+template<typename T>
+void run_cublas_benchmark(const std::string &name,
+                          int variant_id,
+                          cublasHandle_t handle,
+                          const T *d_A, const T *d_B, float *d_C,
+                          int M, int N, int K,
+                          const float *h_ref,
+                          std::vector<BenchmarkResult> &results) {
+
+    std::cout << "\n" << name << "..." << std::endl;
+
+    // Warmup runs
+    for (int i = 0; i < WARMUP_ITERS; i++) {
+        if (variant_id == 3) {  // FP32 cuBLAS
+            cublas_gemm_fp32(handle,
+                            reinterpret_cast<const float*>(d_A),
+                            reinterpret_cast<const float*>(d_B),
+                            d_C, M, N, K);
+        } else if (variant_id == 4) {  // FP16 cuBLAS
+            cublas_gemm_fp16(handle,
+                            reinterpret_cast<const half*>(d_A),
+                            reinterpret_cast<const half*>(d_B),
+                            d_C, M, N, K);
+        } else if (variant_id == 5) {  // BF16 cuBLAS
+            cublas_gemm_bf16(handle,
+                            reinterpret_cast<const __nv_bfloat16*>(d_A),
+                            reinterpret_cast<const __nv_bfloat16*>(d_B),
+                            d_C, M, N, K);
+        }
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Timed runs
+    std::vector<float> times;
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    for (int i = 0; i < BENCHMARK_ITERS; i++) {
+        CUDA_CHECK(cudaEventRecord(start));
+
+        if (variant_id == 3) {
+            cublas_gemm_fp32(handle,
+                            reinterpret_cast<const float*>(d_A),
+                            reinterpret_cast<const float*>(d_B),
+                            d_C, M, N, K);
+        } else if (variant_id == 4) {
+            cublas_gemm_fp16(handle,
+                            reinterpret_cast<const half*>(d_A),
+                            reinterpret_cast<const half*>(d_B),
+                            d_C, M, N, K);
+        } else if (variant_id == 5) {
+            cublas_gemm_bf16(handle,
+                            reinterpret_cast<const __nv_bfloat16*>(d_A),
+                            reinterpret_cast<const __nv_bfloat16*>(d_B),
+                            d_C, M, N, K);
+        }
+
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        times.push_back(ms);
+    }
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    // Statistics
+    float time_mean = compute_mean(times);
+    float time_min = compute_min(times);
+    float time_max = compute_max(times);
+
+    // Calculate TFLOPS
+    double total_flops = 2.0 * M * N * K;
+    double tflops = total_flops / (time_mean * 1e-3) / 1e12;
+
+    // Calculate memory bandwidth
+    size_t element_size = (variant_id == 3) ? sizeof(float) : sizeof(half);
+    double bytes_accessed = (M * K + K * N) * element_size + M * N * sizeof(float);
+    double memory_bandwidth_gb = bytes_accessed / (time_mean * 1e-3) / 1e9;
+
+    // Validate correctness
+    std::vector<float> h_C(M * N);
+    CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+    float max_error = compute_max_error(h_ref, h_C.data(), M * N);
+
+    // Print results
+    std::cout << "  Time (mean): " << std::fixed << std::setprecision(3)
+              << time_mean << " ms  [min: " << time_min << ", max: " << time_max << "]" << std::endl;
+    std::cout << "  Performance: " << std::setprecision(2) << tflops << " TFLOPS" << std::endl;
+    std::cout << "  Memory BW:   " << std::setprecision(1) << memory_bandwidth_gb << " GB/s" << std::endl;
+    std::cout << "  Max Error:   " << std::scientific << std::setprecision(2) << max_error << std::endl;
+
+    // Store result
+    BenchmarkResult result;
+    result.variant_name = name;
+    result.matrix_size = N;
+    result.time_mean_ms = time_mean;
+    result.time_min_ms = time_min;
+    result.time_max_ms = time_max;
+    result.tflops = tflops;
+    result.max_error = max_error;
+    result.memory_bandwidth_gb = memory_bandwidth_gb;
+    results.push_back(result);
+}
+
 // ================================================================================================
 // Main Benchmark Program
 // ================================================================================================
@@ -370,7 +561,8 @@ int main() {
     CUDA_CHECK(cudaGetDevice(&device));
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-	int memoryClockRate = 0, memoryBusWidth = 1;
+
+	int memoryClockRate = 1, memoryBusWidth = 1;
 	CUDA_CHECK(cudaDeviceGetAttribute(&memoryClockRate, cudaDevAttrClockRate, device));
 	CUDA_CHECK(cudaDeviceGetAttribute(&memoryBusWidth, cudaDevAttrGlobalMemoryBusWidth, device));
 
@@ -399,6 +591,13 @@ int main() {
     }
 
     std::vector<BenchmarkResult> all_results;
+
+    // Create cuBLAS handle
+    cublasHandle_t cublas_handle;
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
+
+    // Enable Tensor Core math mode for cuBLAS (for FP16/BF16)
+    CUBLAS_CHECK(cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH));
 
     for (int size : sizes) {
         int M = size, N = size, K = size;
@@ -480,8 +679,11 @@ int main() {
             CUDA_CHECK(cudaMemcpy(d_A16, h_A16.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(d_B16, h_B16.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
 
-            dim3 block(2, 2);  // 4 warps per block
-            dim3 grid((N + WMMA_N - 1) / WMMA_N, (M + WMMA_M - 1) / WMMA_M);
+            // Each block has 128 threads = 4 warps
+            // Each warp computes one 16x16 tile
+            // Block computes 2x2 tiles (32x32 output)
+            dim3 block(64, 2);  // 128 threads = 4 warps
+            dim3 grid((N + 32 - 1) / 32, (M + 32 - 1) / 32);
 
             run_benchmark("FP16 Tensor Cores", 1, d_A16, d_B16, d_C, M, N, K,
                          grid, block, h_C_ref.data(), all_results);
@@ -512,8 +714,9 @@ int main() {
             CUDA_CHECK(cudaMemcpy(d_Bbf16, h_Bbf16.data(), K * N * sizeof(__nv_bfloat16),
                        cudaMemcpyHostToDevice));
 
-            dim3 block(2, 2);
-            dim3 grid((N + WMMA_N - 1) / WMMA_N, (M + WMMA_M - 1) / WMMA_M);
+            // Same configuration as FP16: 4 warps per block
+            dim3 block(64, 2);  // 128 threads = 4 warps
+            dim3 grid((N + 32 - 1) / 32, (M + 32 - 1) / 32);
 
             run_benchmark("BF16 Tensor Cores", 2, d_Abf16, d_Bbf16, d_C, M, N, K,
                          grid, block, h_C_ref.data(), all_results);
@@ -522,7 +725,91 @@ int main() {
             CUDA_CHECK(cudaFree(d_Bbf16));
             CUDA_CHECK(cudaFree(d_C));
         }
+
+        // =========================================================================================
+        // cuBLAS Variants (Gold Standard Baseline)
+        // =========================================================================================
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "      cuBLAS (NVIDIA Optimized)" << std::endl;
+        std::cout << "========================================" << std::endl;
+
+        // =========================================================================================
+        // cuBLAS FP32
+        // =========================================================================================
+        {
+            float *d_A32, *d_B32, *d_C;
+            CUDA_CHECK(cudaMalloc(&d_A32, M * K * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_B32, K * N * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(float)));
+
+            CUDA_CHECK(cudaMemcpy(d_A32, h_A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_B32, h_B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice));
+
+            run_cublas_benchmark("cuBLAS FP32", 3, cublas_handle, d_A32, d_B32, d_C, M, N, K,
+                                h_C_ref.data(), all_results);
+
+            CUDA_CHECK(cudaFree(d_A32));
+            CUDA_CHECK(cudaFree(d_B32));
+            CUDA_CHECK(cudaFree(d_C));
+        }
+
+        // =========================================================================================
+        // cuBLAS FP16 Tensor Cores
+        // =========================================================================================
+        if (prop.major >= 7) {
+            half *d_A16, *d_B16;
+            float *d_C;
+            CUDA_CHECK(cudaMalloc(&d_A16, M * K * sizeof(half)));
+            CUDA_CHECK(cudaMalloc(&d_B16, K * N * sizeof(half)));
+            CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(float)));
+
+            // Convert to FP16
+            std::vector<half> h_A16(M * K);
+            std::vector<half> h_B16(K * N);
+            float_to_half(h_A.data(), h_A16.data(), M * K);
+            float_to_half(h_B.data(), h_B16.data(), K * N);
+
+            CUDA_CHECK(cudaMemcpy(d_A16, h_A16.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_B16, h_B16.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
+
+            run_cublas_benchmark("cuBLAS FP16 Tensor Cores", 4, cublas_handle, d_A16, d_B16, d_C, M, N, K,
+                                h_C_ref.data(), all_results);
+
+            CUDA_CHECK(cudaFree(d_A16));
+            CUDA_CHECK(cudaFree(d_B16));
+            CUDA_CHECK(cudaFree(d_C));
+        }
+
+        // =========================================================================================
+        // cuBLAS BF16 Tensor Cores
+        // =========================================================================================
+        if (prop.major >= 8) {
+            __nv_bfloat16 *d_Abf16, *d_Bbf16;
+            float *d_C;
+            CUDA_CHECK(cudaMalloc(&d_Abf16, M * K * sizeof(__nv_bfloat16)));
+            CUDA_CHECK(cudaMalloc(&d_Bbf16, K * N * sizeof(__nv_bfloat16)));
+            CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(float)));
+
+            // Convert to BF16
+            std::vector<__nv_bfloat16> h_Abf16(M * K);
+            std::vector<__nv_bfloat16> h_Bbf16(K * N);
+            float_to_bfloat16(h_A.data(), h_Abf16.data(), M * K);
+            float_to_bfloat16(h_B.data(), h_Bbf16.data(), K * N);
+
+            CUDA_CHECK(cudaMemcpy(d_Abf16, h_Abf16.data(), M * K * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_Bbf16, h_Bbf16.data(), K * N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+
+            run_cublas_benchmark("cuBLAS BF16 Tensor Cores", 5, cublas_handle, d_Abf16, d_Bbf16, d_C, M, N, K,
+                                h_C_ref.data(), all_results);
+
+            CUDA_CHECK(cudaFree(d_Abf16));
+            CUDA_CHECK(cudaFree(d_Bbf16));
+            CUDA_CHECK(cudaFree(d_C));
+        }
     }
+
+    // Destroy cuBLAS handle
+    CUBLAS_CHECK(cublasDestroy(cublas_handle));
 
     // =========================================================================================
     // Save results to CSV
