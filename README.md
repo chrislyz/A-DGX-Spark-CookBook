@@ -16,10 +16,13 @@
     - [ ] [Applications]()
         - [ ] [Text to Knowledge Graph]()
 - [ ] [Benchmarks](#benchmarks)
-    - [ ] [Our Benchmarks](#our-benchmarks)
-    - [ ] Fine-tuning
-- [ ] Appendix
-    - [ ] Hardware specs https://nvdam.widen.net/s/tlzm8smqjx/workstation-datasheet-dgx-spark-gtc25-spring-nvidia-us-3716899-web
+    - [x] [Our Benchmarks](#our-benchmarks)
+      - [ ] [Fine-tuning](#fine-tuning)
+      - [ ] [Image Generation](#image-generation)
+      - [ ] [Inference](#inference)
+      - [x] [GEMM Benchmarks](#gemm-benchmarks)
+- [x] Appendix
+  - [x] Hardware specs https://nvdam.widen.net/s/tlzm8smqjx/workstation-datasheet-dgx-spark-gtc25-spring-nvidia-us-3716899-web
 
 ## Setup Instructions
 
@@ -33,6 +36,7 @@
     ```bash
     # Setup your account with sudo priviledge and personal home direcotry
     sudo useradd -m -s /bin/bash -G sudo <username>
+    
     
     # Setup password
     sudo passwd <username>
@@ -56,6 +60,7 @@ The most appropriate usage for DGX Spark is the headless server. Each team may h
     sudo nmcli connection modify "<WIFI-SSID>" connection.autoconnect yes
     # If you donot observe "--" value in "permissions" field:
     sudo nmcli connection modify "<WiFi-SSID>" connection.permissions ""
+    
     
     # Test with reboot
     sudo reboot
@@ -219,10 +224,14 @@ This instruction makes a bit tweak to the official [vLLM for Inference](https://
 
 ### Our Benchmarks
 
-**Fine-tuning** is not benchmarked, as the request to LLaMA 3.2 is rejected.
-**Image generation** is not benchmarked, as docker image takes 5-6 GiB to pull.
+#### Fine-tuning
+Fine-tuning is not benchmarked, as the request to LLaMA 3.2 is rejected.
 
-**Inference** is benchmarked as follows.
+#### Image generation
+Image generation is not benchmarked, as docker image takes 5-6 GiB to pull.
+
+#### Inference
+Inference is benchmarked as follows.
 
 ```sh
 llama-bench \
