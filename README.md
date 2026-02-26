@@ -259,7 +259,9 @@ llama-bench \
 |gpt-oss 20B MXFP4 MoE|11.27 GiB|20.91 B|CUDA|1|tg2048|82.20 ± 0.07|
 
 > **How to interpret this result table**:
-> The test starts with prefix pp/tg, as in prompt processing and target generation. And then the following integers represents the number of tokens. Eventually, the last columns simply shows the performance as token per second.
+> 
+> The test starts with prefix pp/tg, as in prompt processing throughput and token generation throughput. And then the following integers represents the number of tokens. Eventually, the last columns simply shows the performance as token per second.
+> 
 > For example, the test pp512 means processing 512 tokens in a prompt. And tg128 profiles the performance to generate 128 tokens.
 
 It can be seen that the performance is approximately identical to what is advertised in the official benmark. And compared to benchmarks on M3 Ultra (512GB, 80GPU cores) previously done by [@ggerganov](https://github.com/ggerganov) in the discussion [guide : running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
